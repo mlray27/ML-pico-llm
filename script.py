@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import gc
+import os
 
 # We do not import numpy or scikit-learn, so we implement a naive k-means in pure PyTorch.
 # If you prefer scikit-learn, you can adapt the code.
@@ -76,6 +77,8 @@ class MixedSequenceDataset(torch.utils.data.Dataset):
         self.other_seqs = other_seqs
         self.p_tiny = p_tiny
 
+        self.END_TOKEN_ID = 50256
+
         self.has_tinystories = (len(self.tinystories_seqs) > 0)
         self.has_other = (len(self.other_seqs) > 0)
 
@@ -101,6 +104,10 @@ class MixedSequenceDataset(torch.utils.data.Dataset):
         else:
             i = random.randint(0, len(self.other_seqs) - 1)
             seq = self.other_seqs[i]
+
+        ##################### add special_token ###################
+        
+        seq = seq + [self.END_TOKEN_ID]
 
         return torch.tensor(seq, dtype=torch.long)
 
@@ -234,6 +241,46 @@ class LSTMSeqModel(nn.Module):
 # 5. Our "stub" Transformer with KV-cache 
 #    Very slow Python loop for training. Multi-head sums head outputs.
 ################################################################################
+def rotate_half(x):
+    x1, x2 = x[..., ::2], x[..., 1::2]
+    return torch.stack([-x2, x1], dim=-1).reshape_as(x)
+
+    
+def apply_rotary_pos_emb(q, k, sin, cos):
+
+
+    q1, q2 = q[..., ::2], q[..., 1::2]
+    k1, k2 = k[..., ::2], k[..., 1::2]
+
+    q_rotated = torch.cat([
+        q1 * cos - q2 * sin,
+        q1 * sin + q2 * cos
+    ], dim=-1)
+
+    k_rotated = torch.cat([
+        k1 * cos - k2 * sin,
+        k1 * sin + k2 * cos
+    ], dim=-1)
+
+    return q_rotated, k_rotated
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=2048):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.einsum("i,j->ij", t, inv_freq)  # (seq_len, dim/2)
+
+        self.register_buffer("sin", torch.sin(freqs).unsqueeze(0), persistent=False)  # (1, seq_len, dim/2)
+        self.register_buffer("cos", torch.cos(freqs).unsqueeze(0), persistent=False)
+
+    def forward(self, seq_len, device):
+        return (
+            self.sin[:, :seq_len, :].to(device),
+            self.cos[:, :seq_len, :].to(device)
+        )
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model, n_heads):
         super().__init__()
@@ -256,13 +303,22 @@ class CausalSelfAttention(nn.Module):
 
         self.k_cache = None
         self.v_cache = None
-    
+
+        self.rope = RotaryEmbedding(self.head_dim, max_seq_len=2048)
+
     def forward(self, x, use_cache=False):
         B, T, C = x.shape
 
-        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)# (B, nh, T, hd)
-        k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)# (B, nh, T, hd)
-        v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)# (B, nh, T, hd)
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
+        k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
+        v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
+        
+        sin, cos = self.rope(T, x.device)
+
+        sin = sin.unsqueeze(1)  # (1, 1, T, hd/2)
+        cos = cos.unsqueeze(1)  # (1, 1, T, hd/2)
+        
+        q, k = apply_rotary_pos_emb(q, k, sin, cos)
         
         if use_cache and self.k_cache is not None and self.v_cache is not None:
             if self.k_cache.device != k.device:
@@ -282,11 +338,10 @@ class CausalSelfAttention(nn.Module):
                 self.k_cache = k
                 self.v_cache = v
 
-
         S = k_all.size(2)
-        att = (q @ k_all.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))# (B, nh, T, S)
+        att = (q @ k_all.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))  # (B, nh, T, S)
         
-        if use_cache and S>T:
+        if use_cache and S > T:
             cache_len = S-T
             att_mask = torch.ones(T, S, device=x.device)
             for i in range(T):
@@ -304,6 +359,54 @@ class CausalSelfAttention(nn.Module):
         y = self.out_proj(y)
         
         return y
+    
+    # def forward(self, x, use_cache=False):
+    #     B, T, C = x.shape
+
+    #     q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)# (B, nh, T, hd)
+    #     k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)# (B, nh, T, hd)
+    #     v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)# (B, nh, T, hd)
+        
+    #     if use_cache and self.k_cache is not None and self.v_cache is not None:
+    #         if self.k_cache.device != k.device:
+    #             self.k_cache = self.k_cache.to(k.device)
+    #             self.v_cache = self.v_cache.to(v.device)
+                
+    #         k_all = torch.cat([self.k_cache, k], dim=2)
+    #         v_all = torch.cat([self.v_cache, v], dim=2)
+            
+    #         self.k_cache = k_all
+    #         self.v_cache = v_all
+    #     else:
+    #         k_all = k
+    #         v_all = v
+            
+    #         if use_cache:
+    #             self.k_cache = k
+    #             self.v_cache = v
+
+
+    #     S = k_all.size(2)
+    #     att = (q @ k_all.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))# (B, nh, T, S)
+        
+    #     if use_cache and S>T:
+    #         cache_len = S-T
+    #         att_mask = torch.ones(T, S, device=x.device)
+    #         for i in range(T):
+    #             att_mask[i, cache_len+i+1:] = 0 
+    #         att_mask = att_mask.view(1, 1, T, S)
+    #         att = att.masked_fill(att_mask == 0, float('-inf'))
+    #     else:
+    #         att = att.masked_fill(self.mask[:, :, :T, :S] == 0, float('-inf'))
+        
+    #     att = F.softmax(att, dim=-1)
+        
+    #     y = att @ v_all  # (B, nh, T, hd)
+        
+    #     y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
+    #     y = self.out_proj(y)
+        
+    #     return y
     
     def clear_cache(self):
         self.k_cache = None
@@ -347,7 +450,7 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4):
+    def __init__(self, vocab_size=50257, d_model=1024, n_heads=4, n_blocks=4):
         super().__init__()
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -448,7 +551,7 @@ def nucleus_sampling(logits, p=0.95):
 #     return torch.argmax(logits).item()
 
 
-def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
+def generate_text(model, enc, init_text, max_new_tokens=500, device="cpu",
                   top_p=None,
                   monosemantic_info=None,
                   do_monosemantic=False):
@@ -462,7 +565,7 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
     """
     was_training = model.training
     model.eval()
-
+    END_TOKEN_ID=50256
     if isinstance(model, TransformerModel):
         model.clear_cache()
         model.enable_cache()
@@ -492,13 +595,17 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
             else:
                 annotation_list.append((chosen_token, []))
 
+            if chosen_token == END_TOKEN_ID:
+                break
+
     if isinstance(model, TransformerModel):
         model.disable_cache()
 
     model.train(was_training)
 
     final_text = enc.decode(context_tokens)
-    prefix_text = enc.decode(context_tokens[:-max_new_tokens])
+    prefix_text = enc.decode(context_tokens[:-len(annotation_list)])
+    # prefix_text = enc.decode(context_tokens[:-max_new_tokens])
     annotated_strs = [prefix_text]
     for (tid, neighs) in annotation_list:
         token_str = enc.decode([tid])
@@ -525,7 +632,7 @@ def train_one_model(model,
                     device,
                     lr=1e-3,
                     log_steps=100,
-                    sample_interval=60,
+                    sample_interval=300,
                     max_steps_per_epoch=None,
                     enc=None,
                     monosemantic_info=None,
@@ -571,41 +678,41 @@ def train_one_model(model,
                 partial_loss = 0.0
                 partial_count = 0
 
-            current_time = time.time()
-            if current_time >= next_sample_time and enc is not None:
-                with torch.no_grad():
-                    print(f"\n[{model_name}] Generating sample text (greedy) at epoch={epoch}, step={batch_idx}...")
-                    text_greedy, ann_greedy = generate_text(
-                        model, enc, prompt, max_new_tokens=20, device=device,
-                        top_p=None,
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
-                    )
-                    print(f" Greedy Sample: {text_greedy}")
-                    print(f" Annotated: {ann_greedy}\n")
+            # current_time = time.time()
+            # if current_time >= next_sample_time and enc is not None:
+            #     with torch.no_grad():python script.py --block_size 256
+            #         print(f"\n[{model_name}] Generating sample text (greedy) at epoch={epoch}, step={batch_idx}...")
+            #         text_greedy, ann_greedy = generate_text(
+            #             model, enc, prompt, max_new_tokens=500, device=device,
+            #             top_p=None,
+            #             monosemantic_info=monosemantic_info,
+            #             do_monosemantic=(monosemantic_info is not None)
+            #         )
+            #         print(f" Greedy Sample: {text_greedy}")
+            #         print(f" Annotated: {ann_greedy}\n")
 
-                    print(f"[{model_name}] Generating sample text (top-p=0.95) at epoch={epoch}, step={batch_idx}...")
-                    text_topp, ann_topp = generate_text(
-                        model, enc, prompt, max_new_tokens=20, device=device,
-                        top_p=0.95,
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
-                    )
-                    print(f" Top-p (p=0.95) Sample: {text_topp}")
-                    print(f" Annotated: {ann_topp}\n")
+            #         print(f"[{model_name}] Generating sample text (top-p=0.95) at epoch={epoch}, step={batch_idx}...")
+            #         text_topp, ann_topp = generate_text(
+            #             model, enc, prompt, max_new_tokens=500, device=device,
+            #             top_p=0.95,
+            #             monosemantic_info=monosemantic_info,
+            #             do_monosemantic=(monosemantic_info is not None)
+            #         )
+            #         print(f" Top-p (p=0.95) Sample: {text_topp}")
+            #         print(f" Annotated: {ann_topp}\n")
 
-                    # third generation => top-p=1.0 => full distribution random sampling
-                    print(f"[{model_name}] Generating sample text (top-p=1.0) at epoch={epoch}, step={batch_idx}...")
-                    text_topp1, ann_topp1 = generate_text(
-                        model, enc, prompt, max_new_tokens=20, device=device,
-                        top_p=1.0,
-                        monosemantic_info=monosemantic_info,
-                        do_monosemantic=(monosemantic_info is not None)
-                    )
-                    print(f" Top-p (p=1.0) Sample: {text_topp1}")
-                    print(f" Annotated: {ann_topp1}\n")
+            #         # third generation => top-p=1.0 => full distribution random sampling
+            #         print(f"[{model_name}] Generating sample text (top-p=1.0) at epoch={epoch}, step={batch_idx}...")
+            #         text_topp1, ann_topp1 = generate_text(
+            #             model, enc, prompt, max_new_tokens=500, device=device,
+            #             top_p=1.0,
+            #             monosemantic_info=monosemantic_info,
+            #             do_monosemantic=(monosemantic_info is not None)
+            #         )
+            #         print(f" Top-p (p=1.0) Sample: {text_topp1}")
+            #         print(f" Annotated: {ann_topp1}\n")
 
-                next_sample_time = current_time + sample_interval
+            #     next_sample_time = current_time + sample_interval
 
             if max_steps_per_epoch is not None and step_in_epoch >= max_steps_per_epoch:
                 print(f"[{model_name}] Reached max_steps_per_epoch={max_steps_per_epoch}, ending epoch {epoch} early.")
@@ -615,6 +722,15 @@ def train_one_model(model,
         print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
 
 
+        checkpoint_path = os.path.join("model_checkpoints", f"{model_name}_epoch_{epoch}.pt")
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': avg_loss,
+            'global_step': global_step,
+        }, checkpoint_path)
+        print(f"[{model_name}] Model saved to {checkpoint_path}")
 ################################################################################
 # 9. Main
 ################################################################################
@@ -628,8 +744,8 @@ def main():
 
     embed_size = args.embed_size
     batch_size = 16
-    num_epochs = 3
-    learning_rate = 1e-3
+    num_epochs = 1
+    learning_rate = 3e-4
 
     block_size = args.block_size
     train_subset_size = 20000
@@ -671,9 +787,18 @@ def main():
         for sample in dataset:
             text = sample['text']
             tokens = enc.encode(text)
-            tokens = tokens[:block_size]
-            if len(tokens) > 0:
-                tinystories_seqs.append(tokens)
+
+            last_idx = 0
+            for i in range(0, len(tokens), block_size):
+                chunk = tokens[i:i+block_size]
+                if len(chunk)>0:
+                    tinystories_seqs.append(chunk)
+                last_idx = i + block_size
+
+            if last_idx < len(tokens):
+                remaining = tokens[last_idx:]
+                if len(remaining)>0:
+                    tinystories_seqs.append(remaining)
         print(f"TinyStories sequences: {len(tinystories_seqs)}")
 
     if args.input_files:
@@ -686,9 +811,18 @@ def main():
                 if not line:
                     continue
                 tokens = enc.encode(line)
-                tokens = tokens[:block_size]
-                if len(tokens) > 0:
-                    other_seqs.append(tokens)
+
+                last_idx = 0
+                for i in range(0, len(tokens), block_size):
+                    chunk = tokens[i:i+block_size]
+                    if len(chunk)>0:
+                        other_seqs.append(chunk)
+                    last_idx = i + block_size
+
+                if last_idx < len(tokens):
+                    remaining = tokens[last_idx:]
+                    if len(remaining)>0:
+                        other_seqs.append(remaining)
         print(f"Custom input files: {len(other_seqs)} sequences loaded.")
     else:
         print("No custom input files provided.")
@@ -757,21 +891,25 @@ def main():
             prompt=args.prompt  # <--- Pass the user-specified prompt here
         )
 
+        # print(f"\n=== Testing model: {model_name} ===")
+        # checkpoint = torch.load('model_checkpoints/kvcache_transformer_epoch_1.pt', map_location=torch.device(args.device_id))
+        # model.load_state_dict(checkpoint['model_state_dict'])
+
         # Final generation from the user-provided prompt (args.prompt).
         with torch.no_grad():
             # 1) Greedy
             text_greedy, ann_greedy = generate_text(
-                model, enc, args.prompt, max_new_tokens=20, device=device,
+                model, enc, args.prompt, max_new_tokens=100, device=device,
                 top_p=None,
             )
             # 2) top-p=0.95
             text_topp, ann_topp = generate_text(
-                model, enc, args.prompt, max_new_tokens=20, device=device,
+                model, enc, args.prompt, max_new_tokens=100, device=device,
                 top_p=0.95,
             )
             # 3) top-p=1.0 => full distribution random sampling
             text_topp1, ann_topp1 = generate_text(
-                model, enc, args.prompt, max_new_tokens=20, device=device,
+                model, enc, args.prompt, max_new_tokens=100, device=device,
                 top_p=1.0,
             )
 
