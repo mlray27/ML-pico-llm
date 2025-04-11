@@ -167,10 +167,20 @@ class KGramMLPSeqModel(nn.Module):
         self.embed_size = embed_size
         self.num_inner_layers = num_inner_layers
         self.chunk_size = chunk_size
+        self.embedding = nn.Embedding(vocab_size, embed_size)
 
-        # fill in
 
-        self.net = None
+        layers = []
+        input_dim = k * embed_size
+        hidden_dim = embed_size
+        output_dim = vocab_size
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.SiLU())
+        for _ in range(num_inner_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.SiLU())
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, tokens_seq):
         """
@@ -194,11 +204,10 @@ class KGramMLPSeqModel(nn.Module):
                     else:
                         context_ids = tokens_seq[t-self.k:t, b].tolist()
 
-                    context_oh = F.one_hot(
-                        torch.tensor(context_ids, dtype=torch.long, device=tokens_seq.device),
-                        num_classes=self.vocab_size
-                    )
-                    context_flat = context_oh.flatten().float().unsqueeze(0)
+                    context_tensor = torch.tensor(context_ids, dtype=torch.long, device=tokens_seq.device)
+                    context_embed = self.embedding(context_tensor)  # (k, embed_size)
+                    context_flat = context_embed.flatten().unsqueeze(0)  # (1, k * embed_size)
+
                     logits_b = self.net(context_flat)  # (1, vocab_size)
                     batch_logits.append(logits_b)
                 block_outputs.append(torch.cat(batch_logits, dim=0).unsqueeze(0))  # (1, batch, vocab_size)
